@@ -1,0 +1,25 @@
+# Environment Configuration for Hybrid Approach
+# Copy this file to .env and update with your actual values
+
+# Google Sheets Configuration (REQUIRED)
+# The hybrid script will download these sheets as Excel files, process them locally,
+# then upload the results back to Google Sheets
+TARGET_SPREADSHEET_ID=your-target-spreadsheet-id-here
+SOURCE_SPREADSHEET_ID=your-source-spreadsheet-id-here
+GOOGLE_CREDENTIALS_FILE=credentials.json
+
+# Email Configuration (REQUIRED for email notifications)
+SENDER_EMAIL=your-email@company.com
+SENDER_PASSWORD=your-app-password
+
+# SMTP Configuration (OPTIONAL - defaults to Gmail)
+SMTP_SERVER=smtp.gmail.com
+SMTP_PORT=587
+
+# Team Email Addresses (update with actual emails)
+GL_EMAIL=geetha@company.com
+NT_EMAIL=nicolas@company.com
+PP_EMAIL=phuong@company.com
+
+# Hybrid Options
+KEEP_LOCAL_FILES=false  # Set to true if you want to keep the downloaded Excel files for debugging 
