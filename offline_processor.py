@@ -130,6 +130,50 @@ def process_single_cqe_file(cqe_file_path):
     mapped_data['Assignment'] = ''  # Empty Assignment column
     mapped_data['Failure Mode'] = ''  # Empty as requested
     
+    # Map Failure Mode based on Title keywords
+    if 'Title' in mapped_data.columns:
+        logger.info("Mapping Failure Mode based on Title keywords...")
+        
+        def map_failure_mode(title):
+            if pd.isna(title) or str(title).strip() == '':
+                return 'Unknown Cause Issue'  # Changed from '' to 'Unknown Cause Issue' for blank titles
+            
+            title_upper = str(title).upper()
+            
+            # Check keywords in order of priority
+            if 'OVERT' in title_upper:
+                return 'Thermal'
+            elif 'SLD' in title_upper or 'POWER' in title_upper:
+                return 'Power'
+            elif 'L2' in title_upper or 'CACHE' in title_upper or 'RMINIT' in title_upper:
+                return 'SRAM Memory'
+            elif 'REMAP' in title_upper:
+                return 'HBM Memory'
+            elif 'ECC' in title_upper or 'UEC' in title_upper or ' CE ' in title_upper or 'DATA MISMATCH' in title_upper or 'CRC' in title_upper or 'DATA/BUFFER' in title_upper:
+                return 'General Memory (SRAM or HBM)'
+            elif 'SUDDEN DEATH' in title_upper or 'SDC' in title_upper or 'THERMAL' in title_upper:
+                return 'Thermal'
+            elif 'XID' in title_upper:
+                return 'Customer ID Specific Issue'
+            elif 'FALLING OFF' in title_upper:
+                return 'GPU Falling Off Bus'
+            elif 'DEVICE INTERRUPT' in title_upper or 'INTERRUPT' in title_upper or 'IST' in title_upper:
+                return 'Unknown Cause Issue'
+            elif 'PCIE' in title_upper:
+                return 'Potential Memory or NVSpec Issues'
+            else:
+                return 'Unknown Cause Issue'  # Changed from '' to 'Unknown Cause Issue' for unmatched cases
+        
+        # Apply the mapping
+        mapped_data['Failure Mode'] = mapped_data['Title'].apply(map_failure_mode)
+        
+        # Log some examples
+        failure_mode_counts = mapped_data['Failure Mode'].value_counts()
+        logger.info("Failure Mode mapping results:")
+        for mode, count in failure_mode_counts.items():
+            if mode:  # Only log non-empty modes
+                logger.info(f"  {mode}: {count} bugs")
+    
     # Track rows that need black highlighting (non-SXM5 products) - BEFORE reordering columns
     rows_to_highlight = []
     if 'Product' in mapped_data.columns:
@@ -213,11 +257,32 @@ def process_single_cqe_file(cqe_file_path):
         mapped_data['Priority'] = priority_col.astype(int)
         logger.info("Filled blank Priority values with sequential numbers")
     
+    # Assign teams based on Failure Mode
+    logger.info("Assigning teams based on Failure Mode...")
+    gl_nt_toggle = True  # Start with GL
+    
+    for idx in range(len(mapped_data)):
+        failure_mode = mapped_data.loc[idx, 'Failure Mode']
+        
+        if failure_mode in ['Power', 'Thermal']:
+            mapped_data.loc[idx, 'Assignment'] = 'PP'
+        else:
+            # Alternate between GL and NT for non-Power/Thermal bugs
+            mapped_data.loc[idx, 'Assignment'] = 'GL' if gl_nt_toggle else 'NT'
+            gl_nt_toggle = not gl_nt_toggle  # Toggle for next non-PP bug
+    
+    # Log assignment summary
+    assignment_counts = mapped_data['Assignment'].value_counts()
+    logger.info("Team assignment results:")
+    for team, count in assignment_counts.items():
+        logger.info(f"  {team}: {count} bugs")
+    
     # Step 3: Create output Excel with proper structure
     logger.info("Creating output Excel file...")
     import openpyxl
     from openpyxl.styles import Font, PatternFill, Alignment
     from openpyxl.styles.colors import Color
+    from openpyxl.worksheet.datavalidation import DataValidation
     
     wb = openpyxl.Workbook()
     
@@ -244,6 +309,16 @@ def process_single_cqe_file(cqe_file_path):
         
         # If this is the Daily New sheet, add all the data
         if sheet_name == 'Daily New':
+            # Create data validation for Assignment column (column 1)
+            dv = DataValidation(type="list", formula1='"GL,NT,PP"', allow_blank=True)
+            dv.error = 'Please select a valid team'
+            dv.errorTitle = 'Invalid Team'
+            dv.prompt = 'Please select a team from the list'
+            dv.promptTitle = 'Team Assignment'
+            
+            # Add the data validation to the worksheet
+            ws.add_data_validation(dv)
+            
             for row_idx, row_data in mapped_data.iterrows():
                 excel_row = row_idx + 2  # Excel row number (1-indexed, plus header)
                 
@@ -252,6 +327,10 @@ def process_single_cqe_file(cqe_file_path):
                 
                 for col_idx, (col_name, value) in enumerate(zip(column_order, row_data), 1):
                     cell = ws.cell(row=excel_row, column=col_idx, value=value)
+                    
+                    # Add dropdown to Assignment column (column 1)
+                    if col_idx == 1:  # Assignment column
+                        dv.add(cell)
                     
                     # Apply black highlighting if needed
                     if should_highlight:
@@ -286,39 +365,231 @@ def process_single_cqe_file(cqe_file_path):
     wb_check.close()
     
     # Step 4: Process with the standard workflow
-    # NOTE: Skipping standard workflow to preserve highlighting
-    logger.info("Skipping standard workflow to preserve custom highlighting...")
+    # NOTE: We'll only do the distribution part to preserve highlighting
+    logger.info("Distributing bugs to team sheets based on Assignment...")
+    
+    # Load the workbook we just created
+    wb_dist = openpyxl.load_workbook(output_file)
+    
+    # Get the Daily New sheet
+    daily_new_sheet = wb_dist['Daily New']
+    
+    # Clear existing data in team sheets (except headers)
+    for team in ['GL', 'NT', 'PP']:
+        team_sheet = wb_dist[team]
+        # Delete all rows except header
+        team_sheet.delete_rows(2, team_sheet.max_row)
+    
+    # Track next available row for each team
+    team_next_row = {'GL': 2, 'NT': 2, 'PP': 2}
+    
+    # Iterate through Daily New sheet and copy rows to appropriate team sheets
+    for row in range(2, daily_new_sheet.max_row + 1):
+        assignment = daily_new_sheet.cell(row=row, column=1).value  # Assignment is column 1
+        
+        if assignment in ['GL', 'NT', 'PP']:
+            # Get the target sheet
+            target_sheet = wb_dist[assignment]
+            target_row = team_next_row[assignment]
+            
+            # Copy the entire row including formatting
+            for col in range(1, daily_new_sheet.max_column + 1):
+                source_cell = daily_new_sheet.cell(row=row, column=col)
+                target_cell = target_sheet.cell(row=target_row, column=col)
+                
+                # Copy value
+                target_cell.value = source_cell.value
+                
+                # Copy formatting (including black highlighting)
+                if source_cell.fill.patternType:
+                    target_cell.fill = PatternFill(
+                        patternType=source_cell.fill.patternType,
+                        fgColor=source_cell.fill.fgColor,
+                        bgColor=source_cell.fill.bgColor
+                    )
+                if source_cell.font:
+                    target_cell.font = Font(
+                        name=source_cell.font.name,
+                        size=source_cell.font.size,
+                        bold=source_cell.font.bold,
+                        italic=source_cell.font.italic,
+                        color=source_cell.font.color
+                    )
+                if source_cell.alignment:
+                    target_cell.alignment = Alignment(
+                        horizontal=source_cell.alignment.horizontal,
+                        vertical=source_cell.alignment.vertical
+                    )
+            
+            # Add dropdown to Assignment column in team sheet
+            dv_team = DataValidation(type="list", formula1='"GL,NT,PP"', allow_blank=True)
+            dv_team.error = 'Please select a valid team'
+            dv_team.errorTitle = 'Invalid Team'
+            dv_team.prompt = 'Please select a team from the list'
+            dv_team.promptTitle = 'Team Assignment'
+            target_sheet.add_data_validation(dv_team)
+            dv_team.add(target_sheet.cell(row=target_row, column=1))
+            
+            # Increment the row counter for this team
+            team_next_row[assignment] += 1
+    
+    # Log distribution results
+    logger.info("Distribution results:")
+    for team in ['GL', 'NT', 'PP']:
+        count = team_next_row[team] - 2  # Subtract 2 to get actual count (header + starting at 2)
+        logger.info(f"  {team}: {count} bugs")
+    
+    # Save the workbook with distributed data
+    wb_dist.save(output_file)
+    wb_dist.close()
+    
+    # Step 5: Remove black-highlighted rows from team sheets
+    logger.info("Removing black-highlighted rows from team sheets...")
+    
+    # Reload the workbook to clean up black rows
+    wb_cleanup = openpyxl.load_workbook(output_file)
+    
+    for team in ['GL', 'NT', 'PP']:
+        team_sheet = wb_cleanup[team]
+        rows_to_delete = []
+        
+        # Check each row for black highlighting (starting from row 2 to skip header)
+        for row in range(2, team_sheet.max_row + 1):
+            # Check if any cell in the row has black fill
+            cell = team_sheet.cell(row=row, column=1)  # Check first cell
+            if cell.fill.fgColor and cell.fill.fgColor.rgb == 'FF000000':
+                rows_to_delete.append(row)
+        
+        # Delete rows in reverse order to maintain correct row numbers
+        for row in reversed(rows_to_delete):
+            team_sheet.delete_rows(row, 1)
+            logger.info(f"Removed black-highlighted row from {team} sheet")
+        
+        if rows_to_delete:
+            logger.info(f"Removed {len(rows_to_delete)} black-highlighted rows from {team} sheet")
+    
+    # Save the cleaned workbook
+    wb_cleanup.save(output_file)
+    wb_cleanup.close()
+    
+    # Log final distribution after cleanup
+    logger.info("Final distribution after removing black-highlighted rows:")
+    wb_final = openpyxl.load_workbook(output_file)
+    for team in ['GL', 'NT', 'PP']:
+        team_sheet = wb_final[team]
+        # Count non-empty rows (excluding header)
+        count = 0
+        for row in range(2, team_sheet.max_row + 1):
+            if any(team_sheet.cell(row=row, column=col).value for col in range(1, 9)):
+                count += 1
+        logger.info(f"  {team}: {count} bugs")
+    wb_final.close()
+    
     logger.info("=== Process completed successfully! ===")
     logger.info(f"Output saved to: {output_file}")
     
-    return output_file
+    # Step 6: Create and send email with team sheet contents
+    logger.info("Preparing bug assignment report...")
     
-    # Commented out to preserve highlighting
-    # try:
-    #     processor = CQEToOursNewest(output_file, None)
-    #     processor.load_workbook()
-    #     
-    #     # Skip the grab_CQE_daily since we already have the data
-    #     processor.assign_dropdown_tags()
-    #     processor.reorder_by_priority('Daily New')
-    #     processor.distribute_to_team_sheets()
-    #     
-    #     for team in ['GL', 'NT', 'PP']:
-    #         processor.reorder_by_priority(team)
-    #     
-    #     processor.delete_completed_bugs()
-    #     processor.send_daily_email()
-    #     
-    #     logger.info("=== Process completed successfully! ===")
-    #     logger.info(f"Output saved to: {output_file}")
-    #     
-    #     return output_file
-    #     
-    # except Exception as e:
-    #     logger.error(f"Error during processing: {e}")
-    #     import traceback
-    #     traceback.print_exc()
-    #     return None
+    # Create HTML email content
+    html_content = create_team_sheets_email_html(output_file)
+    
+    # Save HTML report
+    report_filename = f"bug_report_{datetime.now().strftime('%Y%m%d_%H%M%S')}.html"
+    with open(report_filename, 'w') as f:
+        f.write(html_content)
+    
+    logger.info(f"\n{'='*60}")
+    logger.info(f"HTML Report saved to: {report_filename}")
+    logger.info(f"You can:")
+    logger.info(f"  1. Open it directly in a browser")
+    logger.info(f"  2. Host it with: python -m http.server 8080")
+    logger.info(f"  3. Upload it to any web hosting service")
+    logger.info(f"{'='*60}\n")
+    
+    # Start HTTP server to serve the report
+    serve_html_report(report_filename)
+    
+    return output_file
+
+
+def create_team_sheets_email_html(excel_file):
+    """Create HTML content with tables for each team sheet"""
+    import openpyxl
+    from datetime import datetime
+    
+    wb = openpyxl.load_workbook(excel_file)
+    
+    html = f"""
+    <html>
+    <head>
+        <style>
+            body {{ font-family: Arial, sans-serif; }}
+            h1 {{ color: #333; }}
+            h2 {{ color: #666; margin-top: 30px; }}
+            table {{ border-collapse: collapse; margin-bottom: 30px; width: 100%; }}
+            th {{ background-color: #4CAF50; color: white; padding: 12px; text-align: left; }}
+            td {{ border: 1px solid #ddd; padding: 8px; }}
+            tr:nth-child(even) {{ background-color: #f2f2f2; }}
+            .summary {{ background-color: #e7f3ff; padding: 15px; margin-bottom: 20px; border-radius: 5px; }}
+        </style>
+    </head>
+    <body>
+        <h1>Daily Bug Assignment Report - {datetime.now().strftime('%Y-%m-%d %H:%M')}</h1>
+        <div class="summary">
+            <strong>Summary:</strong><br>
+    """
+    
+    # Add summary counts
+    team_counts = {}
+    for team in ['GL', 'NT', 'PP']:
+        ws = wb[team]
+        count = 0
+        for row in range(2, ws.max_row + 1):
+            if any(ws.cell(row=row, column=col).value for col in range(1, 9)):
+                count += 1
+        team_counts[team] = count
+        html += f"&nbsp;&nbsp;&nbsp;&nbsp;{team}: {count} bugs<br>"
+    
+    html += f"&nbsp;&nbsp;&nbsp;&nbsp;<strong>Total: {sum(team_counts.values())} bugs</strong>"
+    html += "</div>"
+    
+    # Create table for each team
+    for team in ['GL', 'NT', 'PP']:
+        ws = wb[team]
+        html += f"<h2>{team} Team - {team_counts[team]} bugs</h2>"
+        html += "<table>"
+        
+        # Add headers
+        html += "<tr>"
+        headers = ['Assignment', 'Bug ID', 'Priority', 'Title', 'Failure Mode', 
+                  'Created Date', 'COMPLETED', 'SN Associated', 'Product']
+        for header in headers:
+            html += f"<th>{header}</th>"
+        html += "</tr>"
+        
+        # Add data rows
+        for row in range(2, ws.max_row + 1):
+            # Check if row has data
+            if any(ws.cell(row=row, column=col).value for col in range(1, 9)):
+                html += "<tr>"
+                for col in range(1, 10):  # 9 columns including Product
+                    value = ws.cell(row=row, column=col).value or ""
+                    # Truncate long titles for better display
+                    if col == 4 and len(str(value)) > 50:  # Title column
+                        value = str(value)[:50] + "..."
+                    html += f"<td>{value}</td>"
+                html += "</tr>"
+        
+        html += "</table>"
+    
+    html += """
+    </body>
+    </html>
+    """
+    
+    wb.close()
+    return html
 
 
 def run_offline_process(target_excel_path, source_excel_path=None):
@@ -462,7 +733,7 @@ def main():
             if output_file:
                 print(f"\n✅ Processing completed successfully!")
                 print(f"📄 Output file: {output_file}")
-                print(f"📤 You can now upload this file to Google Sheets or Excel Online")
+                print(f"🔗 You can now upload this file to Google Sheets or Excel Online")
             else:
                 print("\n❌ Processing failed. Check the logs above for details.")
                 sys.exit(1)
@@ -486,6 +757,69 @@ def main():
         else:
             print("\n❌ Processing failed. Check the logs above for details.")
             sys.exit(1)
+
+
+def kill_port_8080():
+    """Kill any process using port 8080"""
+    import subprocess
+    try:
+        # Find process using the port
+        result = subprocess.run(['lsof', '-t', '-i', ':8080'], 
+                              capture_output=True, text=True)
+        if result.stdout.strip():
+            pids = result.stdout.strip().split('\n')
+            for pid in pids:
+                logger.info(f"Killing existing process {pid} on port 8080")
+                subprocess.run(['kill', pid])
+            # Give it a moment to release the port
+            import time
+            time.sleep(1)
+            logger.info("Port 8080 cleared")
+    except Exception as e:
+        logger.debug(f"Note: Could not check for existing processes: {e}")
+
+
+def serve_html_report(report_filename):
+    """Start HTTP server to serve the HTML report"""
+    import http.server
+    import socketserver
+    import socket
+    import threading
+    
+    PORT = 8080
+    
+    # Kill any existing server on port 8080
+    kill_port_8080()
+    
+    # Get network info
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        s.connect(("8.8.8.8", 80))
+        ip_address = s.getsockname()[0]
+        s.close()
+    except:
+        ip_address = "localhost"
+    
+    print(f"\n{'='*70}")
+    print(f"🌐 HTML Report is now being served!")
+    print(f"{'='*70}")
+    print(f"📄 Report: {report_filename}")
+    print(f"\n🔗 Access the report at:")
+    print(f"   Local:    http://localhost:{PORT}/{report_filename}")
+    print(f"   Network:  http://{ip_address}:{PORT}/{report_filename}")
+    print(f"{'='*70}")
+    print(f"Press Ctrl+C to stop the server and exit\n")
+    
+    # Start server
+    Handler = http.server.SimpleHTTPRequestHandler
+    try:
+        with socketserver.TCPServer(("", PORT), Handler) as httpd:
+            httpd.serve_forever()
+    except KeyboardInterrupt:
+        print("\n✅ Server stopped. Goodbye!")
+    except Exception as e:
+        print(f"\n❌ Error starting server: {e}")
+        print(f"You can manually serve the report with: python -m http.server {PORT}")
 
 
 if __name__ == "__main__":
