@@ -508,7 +508,8 @@ def process_single_cqe_file(cqe_file_path):
     logger.info(f"{'='*60}\n")
     
     # Start HTTP server to serve the report
-    serve_html_report(report_filename)
+    # Commented out for Streamlit compatibility
+    # serve_html_report(report_filename)
     
     return output_file
 
